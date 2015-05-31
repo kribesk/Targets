@@ -1,0 +1,339 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use IO::Handle;
+use IO::Select;
+
+our $TIMEOUT = 0.05;
+our $WORKERS_LIMIT = 5;
+
+our %TARGETS;
+
+sub depends (@) {
+	my @deps = @_;
+	map { s/^/dep:/ } @deps;
+	return @deps;
+}
+
+sub imply (&) {
+	return shift;
+}
+
+sub target (*@) {
+	my ($name, @v) = @_;
+	my $code = pop @v;
+	my (@deps, @opts);
+	for (@v) {
+		push @deps, $1 if /dep:(.*)/;
+		push @opts, $1 if /opt:(.*)/;
+	}
+	$TARGETS{$name} = {
+		name => $name,
+		opts => \@opts,
+		deps => \@deps,
+		code => $code,
+		done => undef
+	};
+}
+
+sub runtarget (*) {
+	my ($target) = @_;
+	runtarget_parallel ($target);
+}
+
+sub runtarget_serial ($) {
+	my ($target) = @_;
+	my $T = $TARGETS{$target};
+	die "Target $target not found" if (not $T);
+	runtarget_serial $_ for ($T->{deps});
+	&{ $T->{code} };
+}
+
+sub runtarget_parallel ($) {
+	my ($main_target) = @_;
+	my @queue = topsort($main_target);
+	my %workers;
+	my @free_workers;
+	my $select = IO::Select->new;
+
+	while (1) {
+		my @ready = $select->can_read($TIMEOUT);
+		for my $handle (@ready) {
+			my $ans = <$handle>;
+			chomp $ans;
+			if ($workers{$handle}->{state} eq 'init') {
+		 		$workers{$handle}->{state} = 'failed';
+				finalize ($ans, \%workers) if ($ans !~ /started/);
+				$workers{$handle}->{state} = 'free';
+				push @free_workers, $handle;
+			} elsif ($workers{$handle}->{state} eq 'normal') {
+		 		$workers{$handle}->{state} = 'failed';
+				finalize ($ans, \%workers) if ($ans !~ /ok/);
+				$TARGETS{$workers{$handle}->{target}}->{done} = 1;
+				$workers{$handle}->{state} = 'ready';
+				push @free_workers, $handle;
+			}
+		}
+
+		last if ($TARGETS{$main_target}->{done});
+
+		my $target = shift @queue;
+		next if (not defined $target);
+		my $ready = 1;
+		for (@{ $TARGETS{$target}->{deps} }) {
+			if (not defined $TARGETS{$_}->{done}) {
+				$ready = undef;
+				last;
+			}
+		}
+		
+		unshift @queue, $target;
+		if (not defined $ready) {
+			next;
+		}
+
+		if (@free_workers <= 0 and keys %workers < $WORKERS_LIMIT) {
+			my ($pid, $out, $in) = make_worker();
+			$workers{$in} = {
+				pid => $pid,
+				out => $out,
+				in  => $in,
+				state => 'init',
+				target => undef
+			};
+			$select->add($in);
+		}
+
+		if (@free_workers > 0) {
+			my $worker = shift @free_workers;
+			$worker = $workers{$worker};
+			my $out = $worker->{out};
+			print $out "target $target\n";
+			$worker->{target} = shift @queue;
+			$worker->{state} = 'normal';
+		}
+
+	}
+
+	for (keys %workers) {
+		my $w = $workers{$_};
+		stop_worker ($w->{pid}, $w->{out}, $w->{in});
+	}
+}
+
+sub topsort ($) {
+	my $topsort = [];
+	my $visited = {};
+
+	no warnings 'closure';
+	sub dfs {
+		my $t = shift;
+		my $T = $TARGETS{$t};
+		if (not defined $T) {
+			warn "Warning: topsort: undefined target '$t'";
+			return;
+		}
+		$visited->{$t} = 1;
+		for (@{ $T->{deps} }) {
+			dfs ($_) if (not $visited->{$_});
+		}
+		push @{ $topsort }, $t;
+	}
+	use warnings 'closure';
+
+	dfs shift;
+
+	return @{ $topsort };
+}
+
+
+sub worker ($$) {
+	my ($in, $out) = @_;
+	
+	# worker is stupid, does not carry if deps met
+
+	print $out "started $$\n";
+	print "$$ > started $$\n";
+	while (<$in>) {
+		chomp;
+		print "$$ < $_\n";
+		if (/^target (.*)$/) {
+			my $T = $TARGETS{$1};
+			if (not $T) {
+				print $out "error $1 not found\n";
+				print "$$ > error $1 not found\n";
+				next;
+			}
+	
+			my $return = 0;
+			eval { $return = &{$T->{code} } };
+			$return //= 0;
+
+			if ($@) {
+				print $out "error $@\n";
+				print "$$ > error $@\n";
+			} elsif ($return != 0) {
+				print $out "fail $return\n";
+				print "$$ > fail $return\n";
+			} else {
+				print $out "ok $1\n";
+				print "$$ > ok $1\n";
+			}
+
+		} elsif (/^stop/) {
+			last;
+		}
+	}
+	print $out "stopped\n";
+	print "$$ > stopped\n";
+}
+
+sub make_worker () {
+	# some improvised IPC with pipes
+
+	my ($root_to_worker, $worker_from_root);
+	pipe $worker_from_root, $root_to_worker;
+	my ($worker_to_root, $root_from_worker);
+	pipe $root_from_worker, $worker_to_root;
+
+	$_->autoflush (1) for ($root_to_worker, $worker_from_root,
+		$worker_to_root, $root_from_worker);
+
+	my $pid = fork;
+	die "fork failed" if (not defined $pid);
+
+	if (not $pid) {
+		close $root_from_worker;
+		close $root_to_worker;
+		worker ($worker_from_root, $worker_to_root);
+		close $worker_from_root;
+		close $worker_to_root;
+		exit;
+	}
+
+	close $worker_from_root;
+	close $worker_to_root;
+
+	return ($pid, $root_to_worker, $root_from_worker);;
+}
+
+sub stop_worker ($$$) {
+	my ($pid, $root_to_worker, $root_from_worker) = @_;
+	print $root_to_worker "stop\n";
+	my $ans = <$root_from_worker>;
+	chomp $ans;
+	warn "stop_worker failed: $ans\n" if ($ans ne "stopped");
+	close $root_to_worker;
+	close $root_from_worker;
+	waitpid($pid, 0);
+}
+
+sub finalize ($$) {
+	my ($reason, $workers) = @_;
+	print "Build failed: $reason\n";
+	for (keys %$workers) {
+		if ($workers->{$_}->{state} =~ /ready|failed/) {
+			stop_worker (
+				$workers->{$_}->{pid},
+				$workers->{$_}->{out},
+				$workers->{$_}->{in}
+			);
+		} else {
+			# agressive mode
+			kill $workers->{$_}->{pid};
+			print "killed $workers->{$_}->{pid}\n";
+		}
+	}
+	die "FAIL";
+}
+
+# C Code support --------------------------------------------------------------- 
+
+my %CTARGETS;
+
+sub ctarget ($) {
+	my ($name) = @_;
+
+	target "cc_$name",
+	imply {
+		`gcc -c $name.c -o $name.o`;
+		return $?;
+	};
+
+	$CTARGETS{$name} = {
+		target => "cc_$name"
+	};
+}
+
+sub cpptarget ($) {
+	my ($name) = @_;
+
+	target "cpp_$name",
+	imply {
+		`g++ -c $name.cpp -o $name.o`;
+		return $?;
+	};
+
+	$CTARGETS{$name} = {
+		target => "cpp_$name"
+	};
+};
+
+sub clink {
+	my @deps = map { $CTARGETS{$_}->{target} } keys %CTARGETS;
+	my @files = map { $_ . '.o' } keys %CTARGETS;
+
+	target "link",
+	(depends @deps),
+	imply {
+		my $filelist = join " ", @files;
+		`gcc $filelist`;
+		return $?;
+	};
+}
+
+# Main: ------------------------------------------------------------------------ 
+sub main {
+	my $header = <<'HEADER';
+                                                 
+  
+   ______   ______     ______     ______     ______     ______   ______    
+  /\__  _\ /\  __ \   /\  == \   /\  ___\   /\  ___\   /\__  _\ /\  ___\   
+  \/_/\ \/ \ \  __ \  \ \  __<   \ \ \__ \  \ \  __\   \/_/\ \/ \ \___  \  
+     \ \_\  \ \_\ \_\  \ \_\ \_\  \ \_____\  \ \_____\    \ \_\  \/\_____\ 
+      \/_/   \/_/\/_/   \/_/ /_/   \/_____/   \/_____/     \/_/   \/_____/ 
+                                                                           
+
+
+  TARGETS BUILD SYSTEM :: PREVIEW VERSION
+  (C) KRIBESK, 2015
+
+
+HEADER
+	print $header;
+
+	if (@ARGV > 0 and$ARGV[0] eq "selfinstall") {
+		print "Installing TARGETS to your system...\n";
+		`cp -f $0 /usr/bin/`;
+		if ($? != 0) {
+			print "fail!\nYou should have root access.\n";
+		} else {
+			print "ok\n";
+		}
+		exit 0;
+	}
+
+	eval { require 'TARGETS' };
+	if ($@) {
+		print "TARGETS file not found!\n";
+		exit 1;
+	}
+
+	runtarget main if (@ARGV == 0);
+	runtarget $_ for (@ARGV);
+	return 0;
+}
+
+exit main();
